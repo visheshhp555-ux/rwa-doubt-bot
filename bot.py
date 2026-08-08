@@ -355,7 +355,7 @@ async def try_set_slowmode(
 ) -> bool:
     sanitized_seconds = sanitize_slowmode_delay(seconds) if seconds > 0 else 0
     try:
-        await context.bot.set_chat_slow_mode_delay(
+        await context.bot.set_chat_slow_mode(
             chat_id=chat_id,
             slow_mode_delay=sanitized_seconds,
         )
@@ -849,7 +849,7 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     target_delay = seconds if enabled else 0
 
     try:
-        await context.bot.set_chat_slow_mode_delay(chat_id=chat_id, slow_mode_delay=target_delay)
+        await context.bot.set_chat_slow_mode(chat_id=chat_id, slow_mode_delay=target_delay)
         await update_group_config(chat_id, "slowmode", enabled)
         status = f"ON ({seconds} seconds)" if enabled else "OFF"
         msg = f"✅ Slow mode set to {status}."
@@ -888,7 +888,7 @@ async def setslowtime_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
 
     try:
-        await context.bot.set_chat_slow_mode_delay(chat_id=chat_id, slow_mode_delay=seconds)
+        await context.bot.set_chat_slow_mode(chat_id=chat_id, slow_mode_delay=seconds)
         await update_group_config(chat_id, "slowmode_delay", seconds)
         await update_group_config(chat_id, "slowmode", seconds > 0)
 
@@ -1083,7 +1083,7 @@ async def handle_member_transition(
         await send_remove_message(chat_id, user, context)
 
 async def chat_member_updated_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    member_update = update.chat_member
+    member_update = update.chat_member or update.my_chat_member
 
     if not member_update or not update.effective_chat:
         return
@@ -1268,8 +1268,9 @@ def main() -> None:
     application.add_handler(CommandHandler("autoslow", autoslow_command))
     application.add_handler(CommandHandler("setslowschedule", setslowschedule_command))
 
-    # MEMBER EVENTS
+    # MEMBER EVENTS (PTB v22.2 Compatible)
     application.add_handler(ChatMemberHandler(chat_member_updated_handler, ChatMemberHandler.CHAT_MEMBER))
+    application.add_handler(ChatMemberHandler(chat_member_updated_handler, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # GENERAL MESSAGES
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, process_messages))
