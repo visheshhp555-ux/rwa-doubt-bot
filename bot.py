@@ -1114,11 +1114,14 @@ async def process_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     text = update.message.text or update.message.caption or ""
     admin = await is_admin(update, context, user.id)
 
-    # 1. FLOOD CONTROL (EXEMPT ADMINS)
-    if not admin:
-        is_flooding = await check_and_handle_flood(update, context, chat_id, user, config)
+    # 1.     # 1. FLOOD CONTROL (EXEMPT ADMINS + PHOTOS)
+    if not admin and not update.message.photo:
+        is_flooding = await check_and_handle_flood(
+            update, context, chat_id, user, config
+        )
         if is_flooding:
             return
+    
 
     # 2. ANTI-LINK SYSTEM (EXEMPT ADMINS)
     if not admin and contains_disallowed_link(update, text):
