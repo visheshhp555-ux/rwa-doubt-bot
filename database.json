@@ -1,25 +1,3 @@
 {
-  "groups": {
-    "-1001234567890": {
-      "welcome_body": "Welcome to our study group ❤️\n\n📜 Rules: /rules\n📚 Happy Learning! ✨",
-      "exit_body": "TQ for being with us. ❤️",
-      "remove_body": "ko group rules violate karne par remove kar diya gaya hai. 🚫",
-      "rules": "📜 Group Rules:\n1. Be respectful to everyone.\n2. No spam or self-promotion.\n3. Keep the chat clean.",
-      "autodelete": true,
-      "delete_time": 300,
-      "autoreplydelete": true,
-      "reply_delete_time": 1200,
-      "antilink": false,
-      "antibadword": false,
-      "badwords": [],
-      "slowmode": true,
-      "slowmode_delay": 300,
-      "autoslow": true,
-      "autoslow_off_time": "20:00",
-      "autoslow_on_time": "22:00",
-      "warnings": {
-        "987654321": 1
-      }
-    }
-  }
+    "groups": {}
 }
