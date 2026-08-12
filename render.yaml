@@ -1,6 +1,6 @@
-Services:
+services:
   - type: worker
     name: rwa-doubt-bot
-    env: python
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
