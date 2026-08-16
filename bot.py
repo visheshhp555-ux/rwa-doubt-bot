@@ -2276,7 +2276,7 @@ def main() -> None:
                 filters.TEXT
                 | filters.PHOTO
                 | filters.VIDEO
-                | filters.Document.ALL         | filters.AUDIO
+                | filters.Document.ALL                   | filters.AUDIO
                 | filters.VOICE
             )
             & ~filters.COMMAND,
