@@ -1,135 +1,162 @@
 import os
 import re
-import json
 import copy
-import html
-import uuid
-import shutil
+import json
+import time
 import asyncio
 import logging
-from urllib.parse import urlparse
-from typing import Any, Dict, Optional, List, Tuple
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import html
+from typing import Dict, List, Tuple, Any
 
-from telegram import Update, ChatPermissions, Message
-from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram import Update, ChatPermissions
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ChatMemberHandler,
     ContextTypes,
     filters,
 )
 
-# ============================================================
-# CONFIGURATION & CONSTANTS
-# ============================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_FILE = "database.json"
-TIMEZONE = ZoneInfo("Asia/Kolkata")
-
+# ====================================================
+# 0. LOGGING
+# ====================================================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# DEFAULT GROUP SETTINGS
-# ============================================================
+# ====================================================
+# 1. CONFIGURATION
+# ====================================================
+DB_FILE = "database.json"
+
+MAX_TRACKED_MESSAGES_PER_USER = 100
+
+FLOOD_TIMEFRAME = 5.0
+FLOOD_MSG_LIMIT = 5
+FLOOD_COOLDOWN_SEC = 10.0
+
+MIN_DELETE_TIME = 5
+MAX_DELETE_TIME = 86400
 
 DEFAULT_GROUP_SETTINGS: Dict[str, Any] = {
-    "welcome_body": (
-        "Welcome to our study group ❤️\n\n"
-        "📜 Rules: /rules\n"
-        "📚 Happy Learning! ✨"
-    ),
-    "exit_body": "TQ for being with us. ❤️",
-    "remove_body": "ko group rules violate karne par remove kar diya gaya hai. 🚫",
-    "rules": (
-        "📜 Group Rules:\n"
-        "1. Be respectful to everyone.\n"
-        "2. No spam or self-promotion.\n"
-        "3. Keep the chat clean."
-    ),
-    # Bot-generated message deletion
-    "autodelete": True,
+    "welcome_text": "Welcome {mention} to {chat_title}!",
+    "exit_text": "Goodbye {name}!",
+    "remove_text": "{name} was removed/banned from {chat_title}.",
+    "rules": "No rules have been set for this group yet.",
+
+    "auto_delete": True,
     "delete_time": 300,
-    # Auto-reply deletion
-    "autoreplydelete": True,
-    "reply_delete_time": 1200,
-    # Protection
-    "antibadword": True,
-    "badwords": [],
-    # Flood Control
-    "floodcontrol": True,
-    "flood_limit": 5,
-    "flood_window": 10,
-    # Warnings: {user_id: count}
-    "warnings": {},
+    "auto_reply_delete": True,
+    "reply_delete_time": 120,
+
+    "anti_badword": True,
+    "badwords": [
+        "bc", "mc", "bhosdike", "bhenchod", "madarchod",
+        "gandu", "chutiya", "gaand", "saala", "harami",
+        "fuck", "bitch", "bastard", "asshole",
+    ],
+
+    "warn_limit": 3,
+    "user_warnings": {},
+
+    "report_system": True,
+    "report_limit": 5,
+    "reports": {},
 }
 
+DB_CONFIGS: Dict[int, Dict[str, Any]] = {}
 DB_LOCK = asyncio.Lock()
 
-EVENT_DEDUPE: Dict[str, float] = {}
-EVENT_DEDUPE_LOCK = asyncio.Lock()
+USER_MESSAGE_TRACKER: Dict[Tuple[int, int], List[int]] = {}
+USER_MESSAGE_TRACKER_LOCK = asyncio.Lock()
 
-# Temporary In-Memory Storage for Flood Control
 FLOOD_TRACKER: Dict[Tuple[int, int], List[float]] = {}
+FLOOD_COOLDOWN_TRACKER: Dict[Tuple[int, int], float] = {}
 FLOOD_LOCK = asyncio.Lock()
 
-# ============================================================
-# DATABASE MANAGEMENT
-# ============================================================
+WARN_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+REPORT_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+LOCKS_GUARD = asyncio.Lock()
 
-def default_group_config() -> Dict[str, Any]:
-    return copy.deepcopy(DEFAULT_GROUP_SETTINGS)
+ADMIN_CACHE: Dict[Tuple[int, int], Tuple[bool, float]] = {}
+ADMIN_CACHE_TTL = 30.0
+ADMIN_CACHE_LOCK = asyncio.Lock()
 
-def _raw_load_database() -> Dict[str, Any]:
-    if not os.path.exists(DATABASE_FILE):
-        return {"groups": {}}
+# Only actual URLs / invite links are matched.
+RESTRICTED_LINKS_REGEX = re.compile(
+    r"(?:"
+    r"https?://(?:www\.)?"
+    r"(?:instagram\.com|t\.me|telegram\.me|whatsapp\.com|"
+    r"chat\.whatsapp\.com|wa\.me|facebook\.com|fb\.me)"
+    r"(?:/[^\s]*)?"
+    r"|"
+    r"(?:www\.)?"
+    r"(?:instagram\.com|t\.me|telegram\.me|whatsapp\.com|"
+    r"chat\.whatsapp\.com|wa\.me|facebook\.com|fb\.me)"
+    r"/[^\s]+"
+    r")",
+    re.IGNORECASE,
+)
+
+# ====================================================
+# 2. DATABASE
+# ====================================================
+def load_db_from_file() -> None:
+    global DB_CONFIGS
+
+    if not os.path.exists(DB_FILE):
+        DB_CONFIGS = {}
+        return
 
     try:
-        with open(DATABASE_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
-            if not isinstance(data, dict) or not isinstance(data.get("groups"), dict):
-                raise ValueError("Corrupt or invalid DB JSON hierarchy")
-            return data
-    except Exception as error:
-        logger.error("Database corrupt/load error: %s", error)
-        unique_suffix = uuid.uuid4().hex[:6]
-        backup_file = f"{DATABASE_FILE}.corrupt.{int(datetime.now().timestamp())}_{unique_suffix}.bak"
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError("database.json must contain an object")
+
+        DB_CONFIGS = {int(k): v for k, v in data.items()}
+        logger.info("database.json loaded successfully.")
+    except Exception as e:
+        logger.error("Failed to load database.json: %s", e)
+        DB_CONFIGS = {}
+
+
+def _write_db_to_disk() -> None:
+    tmp_file = DB_FILE + ".tmp"
+
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {str(k): v for k, v in DB_CONFIGS.items()},
+                f,
+                indent=4,
+                ensure_ascii=False,
+            )
+
+        os.replace(tmp_file, DB_FILE)
+    except Exception as e:
+        logger.error("Failed writing database.json: %s", e)
         try:
-            shutil.copyfile(DATABASE_FILE, backup_file)
-            logger.info("Corrupt DB backed up to %s", backup_file)
-        except Exception as e:
-            logger.error("Failed to backup corrupt DB file: %s", e)
-        return {"groups": {}}
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except OSError:
+            pass
 
-def _raw_save_database(data: Dict[str, Any]) -> None:
-    try:
-        temp_file = DATABASE_FILE + ".tmp"
-        with open(temp_file, "w", encoding="utf-8") as file:
-            json.dump(data, file, indent=4, ensure_ascii=False)
-        os.replace(temp_file, DATABASE_FILE)
-    except Exception as error:
-        logger.error("Database save error: %s", error)
+
+load_db_from_file()
+
 
 async def get_group_config(chat_id: int) -> Dict[str, Any]:
     async with DB_LOCK:
-        data = _raw_load_database()
-        chat_key = str(chat_id)
+        if chat_id not in DB_CONFIGS:
+            DB_CONFIGS[chat_id] = copy.deepcopy(DEFAULT_GROUP_SETTINGS)
+            _write_db_to_disk()
 
-        if chat_key not in data["groups"]:
-            data["groups"][chat_key] = default_group_config()
-            _raw_save_database(data)
-            return data["groups"][chat_key]
-
-        config = data["groups"][chat_key]
+        config = DB_CONFIGS[chat_id]
         changed = False
 
         for key, default_value in DEFAULT_GROUP_SETTINGS.items():
@@ -137,1113 +164,2140 @@ async def get_group_config(chat_id: int) -> Dict[str, Any]:
                 config[key] = copy.deepcopy(default_value)
                 changed = True
 
-        if "antilink" in config:
-            del config["antilink"]
-            changed = True
-
         if not isinstance(config.get("badwords"), list):
-            config["badwords"] = []
+            config["badwords"] = copy.deepcopy(
+                DEFAULT_GROUP_SETTINGS["badwords"]
+            )
             changed = True
 
-        if not isinstance(config.get("warnings"), dict):
-            config["warnings"] = {}
+        if not isinstance(config.get("user_warnings"), dict):
+            config["user_warnings"] = {}
+            changed = True
+
+        if not isinstance(config.get("reports"), dict):
+            config["reports"] = {}
             changed = True
 
         if changed:
-            _raw_save_database(data)
+            DB_CONFIGS[chat_id] = config
+            _write_db_to_disk()
 
-        return config
+        return copy.deepcopy(config)
 
-async def update_group_config(chat_id: int, key: str, value: Any) -> None:
+
+async def update_group_config(
+    chat_id: int,
+    key: str,
+    value: Any,
+) -> None:
     async with DB_LOCK:
-        data = _raw_load_database()
-        chat_key = str(chat_id)
+        if chat_id not in DB_CONFIGS:
+            DB_CONFIGS[chat_id] = copy.deepcopy(
+                DEFAULT_GROUP_SETTINGS
+            )
 
-        if chat_key not in data["groups"]:
-            data["groups"][chat_key] = default_group_config()
+        config = DB_CONFIGS[chat_id]
+        config[key] = copy.deepcopy(value)
 
-        data["groups"][chat_key][key] = value
-        _raw_save_database(data)
+        for k, default_value in DEFAULT_GROUP_SETTINGS.items():
+            if k not in config:
+                config[k] = copy.deepcopy(default_value)
 
-async def update_user_warning(chat_id: int, user_id: int, increment: bool = True) -> int:
-    async with DB_LOCK:
-        data = _raw_load_database()
-        chat_key = str(chat_id)
-        user_key = str(user_id)
+        DB_CONFIGS[chat_id] = config
+        _write_db_to_disk()
 
-        if chat_key not in data["groups"]:
-            data["groups"][chat_key] = default_group_config()
 
-        warnings = data["groups"][chat_key].get("warnings", {})
-        if not isinstance(warnings, dict):
-            warnings = {}
+# ====================================================
+# 3. LOCK HELPERS
+# ====================================================
+async def get_user_lock(
+    lock_store: Dict[Tuple[int, int], asyncio.Lock],
+    key: Tuple[int, int],
+) -> asyncio.Lock:
+    async with LOCKS_GUARD:
+        lock = lock_store.get(key)
 
-        if increment:
-            current_count = int(warnings.get(user_key, 0)) + 1
-            warnings[user_key] = current_count
-        else:
-            warnings[user_key] = 0
-            current_count = 0
+        if lock is None:
+            lock = asyncio.Lock()
+            lock_store[key] = lock
 
-        data["groups"][chat_key]["warnings"] = warnings
-        _raw_save_database(data)
-        return current_count
+        return lock
 
-# ============================================================
-# SAFE HELPERS & UTILITIES
-# ============================================================
 
+# ====================================================
+# 4. UTILITIES
+# ====================================================
 def get_name(user) -> str:
-    """Returns RAW un-escaped name string to prevent double escaping."""
     if not user:
-        return "Member"
-    return (
-        getattr(user, "first_name", None)
-        or getattr(user, "full_name", None)
-        or "Member"
+        return "User"
+
+    return user.first_name or user.username or "User"
+
+
+def safe_title(chat) -> str:
+    return html.escape(chat.title or "Group")
+
+
+def render_template(template: str, user=None, chat=None) -> str:
+    name = html.escape(get_name(user))
+    title = safe_title(chat) if chat else "Group"
+
+    mention = (
+        f'<a href="tg://user?id={user.id}">{name}</a>'
+        if user
+        else "User"
     )
 
-def get_user_mention(user) -> str:
-    """Returns HTML safe user mention."""
-    if not user:
-        return "Member"
-    if getattr(user, "username", None):
-        return f"@{user.username}"
-    safe_name = html.escape(get_name(user))
-    return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
+    return (
+        template
+        .replace("{mention}", mention)
+        .replace("{name}", name)
+        .replace("{chat_title}", title)
+    )
+
 
 async def is_admin(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
 ) -> bool:
-    if not update.effective_chat:
+    chat = update.effective_chat
+
+    if not chat:
         return False
 
-    if update.effective_chat.type == ChatType.PRIVATE:
-        return True
+    key = (chat.id, user_id)
+    now = time.monotonic()
+
+    async with ADMIN_CACHE_LOCK:
+        cached = ADMIN_CACHE.get(key)
+
+        if cached and now - cached[1] < ADMIN_CACHE_TTL:
+            return cached[0]
 
     try:
         member = await context.bot.get_chat_member(
-            update.effective_chat.id,
+            chat.id,
             user_id,
         )
-        return member.status in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        )
-    except TelegramError as error:
-        logger.warning("Admin check failed for user %s: %s", user_id, error)
-        return False
 
-async def bot_can_manage_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_chat:
-        return False
-    try:
-        bot_member = await context.bot.get_chat_member(
-            update.effective_chat.id,
-            context.bot.id,
+        result = member.status in (
+            "administrator",
+            "creator",
         )
-        if bot_member.status == ChatMemberStatus.ADMINISTRATOR:
-            return getattr(bot_member, "can_restrict_members", True)
-        return False
     except TelegramError:
-        return False
+        result = False
 
-def schedule_auto_delete(
-    context: ContextTypes.DEFAULT_TYPE,
+    async with ADMIN_CACHE_LOCK:
+        ADMIN_CACHE[key] = (result, now)
+
+        if len(ADMIN_CACHE) > 5000:
+            oldest = sorted(
+                ADMIN_CACHE.items(),
+                key=lambda item: item[1][1],
+            )[:1000]
+
+            for old_key, _ in oldest:
+                ADMIN_CACHE.pop(old_key, None)
+
+    return result
+
+
+async def invalidate_admin_cache(
+    chat_id: int,
+    user_id: int,
+) -> None:
+    async with ADMIN_CACHE_LOCK:
+        ADMIN_CACHE.pop((chat_id, user_id), None)
+
+
+# ====================================================
+# 5. AUTO DELETE
+# ====================================================
+async def auto_delete_task(
     chat_id: int,
     message_id: int,
     delay: int,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    if delay <= 0 or not context.job_queue:
-        return
+    try:
+        await asyncio.sleep(delay)
 
-    async def delete_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except TelegramError:
-            pass
+        await context.bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    except (TelegramError, asyncio.CancelledError):
+        pass
 
-    context.job_queue.run_once(delete_job, delay)
 
-async def reply_and_autodelete(
+async def reply_with_autodelete(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
-    is_reply_type: bool = False,
-    parse_mode: Optional[str] = ParseMode.HTML,
-) -> Optional[Message]:
-    if not update.effective_chat or not update.effective_message:
-        return None
+    is_reply: bool = False,
+    is_auto_reply: bool = False,
+) -> None:
+    if not update.message or not update.effective_chat:
+        return
 
     chat_id = update.effective_chat.id
     config = await get_group_config(chat_id)
 
     try:
-        sent = await update.effective_message.reply_text(
-            text,
-            disable_web_page_preview=True,
-            parse_mode=parse_mode,
+        if is_reply and update.message.reply_to_message:
+            sent = await update.message.reply_to_message.reply_text(
+                text,
+                parse_mode="HTML",
+            )
+        else:
+            sent = await update.message.reply_text(
+                text,
+                parse_mode="HTML",
+            )
+    except TelegramError as e:
+        logger.error("Failed to send response: %s", e)
+        return
+
+    enabled_key = (
+        "auto_reply_delete"
+        if is_auto_reply
+        else "auto_delete"
+    )
+
+    delay_key = (
+        "reply_delete_time"
+        if is_auto_reply
+        else "delete_time"
+    )
+
+    if config.get(enabled_key, True):
+        try:
+            delay = int(config.get(delay_key, 120))
+        except (TypeError, ValueError):
+            delay = 120
+
+        delay = max(
+            MIN_DELETE_TIME,
+            min(delay, MAX_DELETE_TIME),
         )
 
-        delay_key = "reply_delete_time" if is_reply_type else "delete_time"
-        enabled_key = "autoreplydelete" if is_reply_type else "autodelete"
-
-        if config.get(enabled_key, True):
-            schedule_auto_delete(
-                context,
+        asyncio.create_task(
+            auto_delete_task(
                 chat_id,
                 sent.message_id,
-                int(config.get(delay_key, 300)),
+                delay,
+                context,
             )
+        )
 
-        return sent
-    except TelegramError as error:
-        logger.error("Error sending message in chat %s: %s", chat_id, error)
-        return None
 
 async def send_standalone_autodelete(
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
-    delay: int = 300,
-    parse_mode: Optional[str] = ParseMode.HTML
-) -> Optional[Message]:
+) -> None:
     try:
+        config = await get_group_config(chat_id)
+
         sent = await context.bot.send_message(
-            chat_id=chat_id, 
-            text=text, 
-            parse_mode=parse_mode,
-            disable_web_page_preview=True
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
         )
-        schedule_auto_delete(context, chat_id, sent.message_id, delay)
-        return sent
-    except TelegramError as error:
-        logger.error("Standalone message send failed in chat %s: %s", chat_id, error)
-        return None
 
-async def event_seen_recently(chat_id: int, user_id: int, event_type: str) -> bool:
-    now = asyncio.get_running_loop().time()
-    key = f"{chat_id}:{user_id}:{event_type}"
+        if config.get("auto_delete", True):
+            try:
+                delay = int(
+                    config.get("delete_time", 300)
+                )
+            except (TypeError, ValueError):
+                delay = 300
 
-    async with EVENT_DEDUPE_LOCK:
-        old_keys = [k for k, timestamp in EVENT_DEDUPE.items() if now - timestamp > 10]
-        for old_key in old_keys:
-            EVENT_DEDUPE.pop(old_key, None)
+            delay = max(
+                MIN_DELETE_TIME,
+                min(delay, MAX_DELETE_TIME),
+            )
 
-        if key in EVENT_DEDUPE and now - EVENT_DEDUPE[key] < 5:
-            return True
+            asyncio.create_task(
+                auto_delete_task(
+                    chat_id,
+                    sent.message_id,
+                    delay,
+                    context,
+                )
+            )
 
-        EVENT_DEDUPE[key] = now
-        return False
+    except TelegramError as e:
+        logger.error(
+            "Failed sending standalone message: %s",
+            e,
+        )
 
-# ============================================================
-# UNICODE-SAFE URL EXTRACTION & STRICT HOSTNAME PARSING
-# ============================================================
 
-def is_allowed_hostname(hostname: str) -> bool:
-    """Strictly checks if host domain belongs exclusively to genuine YouTube domains."""
-    if not hostname:
-        return False
-    
-    clean_host = hostname.lower().strip()
-    allowed_domains = {
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com",
-        "youtu.be",
-    }
-    return clean_host in allowed_domains
+# ====================================================
+# 6. MESSAGE TRACKER
+# ====================================================
+async def track_user_message(
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+) -> None:
+    key = (chat_id, user_id)
 
-def contains_disallowed_link(update: Update, text: str) -> bool:
-    """Detects URLs using PTB parse_entity (Unicode Safe) and strict URL parsing."""
-    if not text:
-        text = ""
+    async with USER_MESSAGE_TRACKER_LOCK:
+        messages = USER_MESSAGE_TRACKER.get(key, [])
 
-    message = update.message
-    extracted_urls: List[str] = []
+        messages.append(message_id)
 
-    # 1. Native Telegram Entity Parsing
-    if message:
-        for entity_attr in ("entities", "caption_entities"):
-            entities = getattr(message, entity_attr, None)
-            if entities:
-                for entity in entities:
-                    if entity.type == "url":
-                        try:
-                            extracted_urls.append(message.parse_entity(entity))
-                        except Exception:
-                            pass
-                    elif entity.type == "text_link":
-                        if getattr(entity, "url", None):
-                            extracted_urls.append(entity.url)
+        if len(messages) > MAX_TRACKED_MESSAGES_PER_USER:
+            messages = messages[
+                -MAX_TRACKED_MESSAGES_PER_USER:
+            ]
 
-    # 2. Universal Regex to catch raw URLs
-    raw_pattern = r"(?i)\b(?:https?://|ftp://|www\.)?[a-z0-9\-\.]+\.(?:[a-z]{2,20}|[0-9]{1,3})(?:/[^\s]*)?"
-    extracted_urls.extend(re.findall(raw_pattern, text))
+        USER_MESSAGE_TRACKER[key] = messages
 
-    # 3. Obfuscated domains (e.g., "site dot com")
-    obfuscated_pattern = r"(?i)\b[a-z0-9\-]+\s*(?:\.|\(dot\)|\[dot\]|dot)\s*[a-z]{2,10}\b"
-    if re.search(obfuscated_pattern, text):
-        sanitized_obs = re.sub(r"\s*(?:\(dot\)|\[dot\]|dot)\s*", ".", text, flags=re.IGNORECASE)
-        extracted_urls.extend(re.findall(raw_pattern, sanitized_obs))
+        if len(USER_MESSAGE_TRACKER) > 1000:
+            old_keys = list(
+                USER_MESSAGE_TRACKER.keys()
+            )[:-500]
 
-    if not extracted_urls:
-        return False
+            for old_key in old_keys:
+                USER_MESSAGE_TRACKER.pop(
+                    old_key,
+                    None,
+                )
 
-    # Verify each extracted URL against allowed YouTube hostnames
-    for raw_url in extracted_urls:
-        url_to_parse = raw_url if raw_url.startswith(("http://", "https://")) else "http://" + raw_url
+
+async def delete_tracked_user_messages(
+    chat_id: int,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    key = (chat_id, user_id)
+
+    async with USER_MESSAGE_TRACKER_LOCK:
+        message_ids = list(
+            USER_MESSAGE_TRACKER.get(key, [])
+        )
+
+        USER_MESSAGE_TRACKER.pop(key, None)
+
+    deleted = 0
+
+    for message_id in message_ids:
         try:
-            parsed = urlparse(url_to_parse)
-            hostname = parsed.hostname
-            if not hostname or not is_allowed_hostname(hostname):
-                return True
-        except Exception:
-            return True
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            deleted += 1
+        except TelegramError:
+            pass
 
-    return False
+    return deleted
 
-# ============================================================
-# DETECTION LOGIC (QUESTIONS, GREETINGS & BADWORDS)
-# ============================================================
 
-def is_greeting_message(text: str) -> bool:
+# ====================================================
+# 7. WELCOME / EXIT / REMOVE
+# ====================================================
+async def chat_member_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+    config = await get_group_config(chat_id)
+
+    if update.message.new_chat_members:
+        for member in update.message.new_chat_members:
+            if member.is_bot:
+                continue
+
+            template = config.get(
+                "welcome_text",
+                DEFAULT_GROUP_SETTINGS["welcome_text"],
+            )
+
+            text = render_template(
+                template,
+                member,
+                update.effective_chat,
+            )
+
+            await reply_with_autodelete(
+                update,
+                context,
+                text,
+            )
+
+    if update.message.left_chat_member:
+        member = update.message.left_chat_member
+
+        if member.is_bot:
+            return
+
+        template = config.get(
+            "exit_text",
+            DEFAULT_GROUP_SETTINGS["exit_text"],
+        )
+
+        try:
+            member_state = await context.bot.get_chat_member(
+                chat_id,
+                member.id,
+            )
+
+            if member_state.status == "kicked":
+                template = config.get(
+                    "remove_text",
+                    DEFAULT_GROUP_SETTINGS["remove_text"],
+                )
+
+        except TelegramError:
+            pass
+
+        text = render_template(
+            template,
+            member,
+            update.effective_chat,
+        )
+
+        await reply_with_autodelete(
+            update,
+            context,
+            text,
+        )
+
+
+async def setwelcome_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    text = update.message.text.partition(" ")[2].strip()
+
     if not text:
-        return False
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: <code>/setwelcome "
+            "Welcome {mention} to {chat_title}!</code>",
+        )
+        return
 
-    clean_text = re.sub(r"[^\w\s]", "", text.lower()).strip()
-    exact_greetings = {
-        "radhe radhe", "radhe radhe ji", "radhe krishna",
-        "hello", "hlo", "helo", "hi", "hii", "hiii", "hyy", "hy",
-        "hello friends", "hlo friends", "hy friends", "hi friends",
-        "hlo all", "hello everyone", "hii all", "hi everyone"
-    }
+    await update_group_config(
+        update.effective_chat.id,
+        "welcome_text",
+        text,
+    )
 
-    return clean_text in exact_greetings
+    await reply_with_autodelete(
+        update,
+        context,
+        "✅ Welcome message updated.",
+    )
 
-def is_question_message(text: str) -> bool:
+
+async def setexit_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    text = update.message.text.partition(" ")[2].strip()
+
     if not text:
-        return False
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: <code>/setexit Goodbye {name}!</code>",
+        )
+        return
 
-    lower_text = text.lower().strip()
+    await update_group_config(
+        update.effective_chat.id,
+        "exit_text",
+        text,
+    )
 
-    casual_phrases = {
-        "kya haal hai", "kya haal hai bhai", "kya kar rahe ho", "kya ho raha hai",
-        "kya hua", "kya chal raha hai", "kaisa hai", "kaise ho", "kaise ho bhai"
-    }
-    clean_casual = re.sub(r"[^\w\s]", "", lower_text)
-    if clean_casual in casual_phrases:
-        return False
+    await reply_with_autodelete(
+        update,
+        context,
+        "✅ Exit message updated.",
+    )
 
-    if lower_text in ("doubt", "doubt hai", "question", "question hai", "1 doubt", "sir doubt"):
-        return True
 
-    strict_patterns = [
-        r"\b(solve|solution|answer|explain|explanation|doubt)\b",
-        r"\b(ye kaise hoga|kaise solve kare|kaise solve hoga|iska answer kya|iska solution)\b",
-        r"\b(उत्तर|हल|समाधान|डाउट)\b",
-    ]
+async def setremove_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
 
-    for pattern in strict_patterns:
-        if re.search(pattern, lower_text):
-            return True
+    text = update.message.text.partition(" ")[2].strip()
 
-    if lower_text.endswith("?") or lower_text.endswith("??"):
-        question_words = ["kaise", "kya", "kyu", "kyun", "kab", "kahan", "kon", "kaun", "how", "what", "why", "which"]
-        if any(w in lower_text.split() for w in question_words):
-            return True
-
-    return False
-
-def normalize_badword_text(text: str) -> str:
     if not text:
-        return ""
-    text = text.lower()
-    text = re.sub(r'[@$10!3]', lambda m: {'@':'a', '$':'s', '1':'i', '0':'o', '!':'i', '3':'e'}[m.group(0)], text)
-    text = re.sub(r'[^a-z0-9]', '', text)
-    text = re.sub(r'(.)\1+', r'\1', text)
-    return text
-
-def text_contains_badword(text: str, badwords: list) -> bool:
-    if not text or not badwords:
-        return False
-
-    normalized_text = normalize_badword_text(text)
-
-    for word in badwords:
-        word_str = str(word).strip().lower()
-        if not word_str:
-            continue
-
-        pattern = r"(?<!\w)" + re.escape(word_str) + r"(?!\w)"
-        if re.search(pattern, text, re.IGNORECASE):
-            return True
-
-        normalized_word = normalize_badword_text(word_str)
-        if normalized_word and normalized_word in normalized_text:
-            return True
-
-    return False
-
-# ============================================================
-# BASIC COMMANDS
-# ============================================================
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply_and_autodelete(update, context, "👋 Hello! Main aapka Group Management Bot hoon.")
-
-async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat:
-        return
-    config = await get_group_config(update.effective_chat.id)
-    await reply_and_autodelete(update, context, html.escape(config["rules"]), parse_mode=ParseMode.HTML)
-
-async def setrules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-    if not await is_admin(update, context, update.effective_user.id):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: <code>/setremove "
+            "{name} was removed from {chat_title}.</code>",
+        )
         return
 
-    text = " ".join(context.args).strip()
+    await update_group_config(
+        update.effective_chat.id,
+        "remove_text",
+        text,
+    )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        "✅ Removal message updated.",
+    )
+
+
+# ====================================================
+# 8. RULES
+# ====================================================
+async def rules_command(update, context):
+    config = await get_group_config(
+        update.effective_chat.id
+    )
+
+    rules = config.get(
+        "rules",
+        "No rules set yet.",
+    )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        f"📋 <b>Group Rules</b>\n\n"
+        f"{html.escape(rules)}",
+    )
+
+
+async def setrules_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    text = update.message.text.partition(" ")[2].strip()
+
     if not text:
-        await reply_and_autodelete(update, context, "❌ Usage: /setrules <rules text>")
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: <code>/setrules "
+            "&lt;rules text&gt;</code>",
+        )
         return
 
-    await update_group_config(update.effective_chat.id, "rules", text)
-    await reply_and_autodelete(update, context, "✅ Group rules updated successfully!")
+    await update_group_config(
+        update.effective_chat.id,
+        "rules",
+        text,
+    )
 
-async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-    if not await is_admin(update, context, update.effective_user.id):
-        return
+    await reply_with_autodelete(
+        update,
+        context,
+        "✅ Group rules updated.",
+    )
 
-    text = " ".join(context.args).strip()
-    if not text:
-        await reply_and_autodelete(update, context, "❌ Usage: /setwelcome <welcome body>")
-        return
 
-    await update_group_config(update.effective_chat.id, "welcome_body", text)
-    await reply_and_autodelete(update, context, "✅ Welcome body updated.")
-
-async def setexit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    text = " ".join(context.args).strip()
-    if not text:
-        await reply_and_autodelete(update, context, "❌ Usage: /setexit <exit body>")
-        return
-
-    await update_group_config(update.effective_chat.id, "exit_body", text)
-    await reply_and_autodelete(update, context, "✅ Exit body updated.")
-
-async def setremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    text = " ".join(context.args).strip()
-    if not text:
-        await reply_and_autodelete(update, context, "❌ Usage: /setremove <remove body>")
-        return
-
-    await update_group_config(update.effective_chat.id, "remove_body", text)
-    await reply_and_autodelete(update, context, "✅ Remove body updated.")
-
-# ============================================================
-# MODERATION (WARN / BAN / MUTE)
-# ============================================================
-
-async def apply_warning_logic(
+# ====================================================
+# 9. WARNING SYSTEM
+# ====================================================
+async def warn_user_internal(
     chat_id: int,
     target_user,
     context: ContextTypes.DEFAULT_TYPE,
-    reason_prefix: str = ""
+    reason: str = "",
 ) -> None:
-    """Centralized Warning Engine: 3 warnings -> Auto Ban (Safe Guarded)."""
-    config = await get_group_config(chat_id)
-    count = await update_user_warning(chat_id, target_user.id, increment=True)
-    target_mention = get_user_mention(target_user)
-
-    if count >= 3:
-        try:
-            # Check if bot actually has Ban Permissions
-            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-            can_ban = bot_member.status == ChatMemberStatus.ADMINISTRATOR and getattr(bot_member, "can_restrict_members", False)
-            
-            if can_ban:
-                await context.bot.ban_chat_member(chat_id, target_user.id)
-                await update_user_warning(chat_id, target_user.id, increment=False)
-                safe_name = html.escape(get_name(target_user))
-                remove_body = config.get("remove_body", "")
-                msg = f"🚫 <b>{safe_name}</b> {html.escape(remove_body)}"
-            else:
-                msg = f"⚠️ {target_mention} ki 3 warnings ho gayi hain par Bot ke paas 'Ban Permission' nahi hai."
-        except TelegramError as error:
-            logger.error("Auto-ban failed: %s", error)
-            msg = f"⚠️ {target_mention} ki 3 warnings ho gayi hain lekin Auto-Ban execute nahi ho saka."
-    elif count == 2:
-        prefix = f"{reason_prefix} " if reason_prefix else ""
-        msg = f"🚨 {prefix}{target_mention} ko warning di gayi. <b>Warnings: 2/3</b>\n⚠️ <i>Phir se violation karne par aapko BAN kar diya jayega!</i>"
-    else:
-        prefix = f"{reason_prefix} " if reason_prefix else ""
-        msg = f"⚠️ {prefix}{target_mention} ko warning di gayi. <b>Warnings: {count}/3</b>"
-
-    await send_standalone_autodelete(
-        chat_id, context, msg, delay=int(config.get("delete_time", 300))
+    lock = await get_user_lock(
+        WARN_LOCKS,
+        (chat_id, target_user.id),
     )
 
-async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
+    should_mute = False
+    current = 0
+    limit = 3
+    key = str(target_user.id)
+
+    async with lock:
+        config = await get_group_config(chat_id)
+        warnings = config.get(
+            "user_warnings",
+            {},
+        )
+
+        try:
+            current = int(
+                warnings.get(key, 0)
+            ) + 1
+        except (TypeError, ValueError):
+            current = 1
+
+        warnings[key] = current
+
+        try:
+            limit = int(
+                config.get("warn_limit", 3)
+            )
+        except (TypeError, ValueError):
+            limit = 3
+
+        limit = max(1, min(limit, 20))
+
+        if current >= limit:
+            should_mute = True
+
+        await update_group_config(
+            chat_id,
+            "user_warnings",
+            warnings,
+        )
+
+    name = html.escape(
+        get_name(target_user)
+    )
+
+    # Warning limit reached -> mute, NOT ban.
+    if should_mute:
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=target_user.id,
+                permissions=ChatPermissions(
+                    can_send_messages=False
+                ),
+            )
+
+            async with lock:
+                config = await get_group_config(chat_id)
+                warnings = config.get(
+                    "user_warnings",
+                    {},
+                )
+                warnings[key] = 0
+
+                await update_group_config(
+                    chat_id,
+                    "user_warnings",
+                    warnings,
+                )
+
+            await send_standalone_autodelete(
+                chat_id,
+                context,
+                f"🔇 <b>{name}</b> has been muted!\n"
+                f"Warning limit reached "
+                f"({limit}/{limit}).",
+            )
+
+        except TelegramError as e:
+            logger.error(
+                "Failed to mute warned user: %s",
+                e,
+            )
+
+            await send_standalone_autodelete(
+                chat_id,
+                context,
+                f"⚠️ <b>{name}</b> reached warning limit "
+                f"({limit}/{limit}), but the bot could not mute "
+                f"the user. Check admin permissions.",
+            )
+
         return
 
-    if not await is_admin(update, context, update.effective_user.id):
+    reason_text = (
+        f"\nReason: <i>{html.escape(reason)}</i>"
+        if reason
+        else ""
+    )
+
+    await send_standalone_autodelete(
+        chat_id,
+        context,
+        f"⚠️ <b>{name}</b> warned! "
+        f"({current}/{limit}).{reason_text}",
+    )
+
+
+async def warn_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    if not update.message or not update.message.reply_to_message:
-        await reply_and_autodelete(update, context, "❌ Member ke message ko reply karke /warn likhein.")
+    if not update.message.reply_to_message:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a member's message "
+            "to warn them.",
+        )
         return
 
-    target = update.message.reply_to_message.from_user
+    target = (
+        update.message.reply_to_message.from_user
+    )
+
     if not target or target.is_bot:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Cannot warn bot accounts.",
+        )
+        return
+
+    if await is_admin(
+        update,
+        context,
+        target.id,
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Admins cannot be warned.",
+        )
+        return
+
+    reason = (
+        update.message.text.partition(" ")[2].strip()
+        or "Admin Warning"
+    )
+
+    await warn_user_internal(
+        update.effective_chat.id,
+        target,
+        context,
+        reason,
+    )
+
+
+async def resetwarning_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    if not update.message.reply_to_message:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a user's message.",
+        )
+        return
+
+    target = (
+        update.message.reply_to_message.from_user
+    )
+
+    if not target:
         return
 
     chat_id = update.effective_chat.id
-
-    if await is_admin(update, context, target.id):
-        await reply_and_autodelete(update, context, "❌ Admin ko warning nahi di ja sakti.")
-        return
-
-    await apply_warning_logic(chat_id, target, context)
-
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    if not await bot_can_manage_members(update, context):
-        await reply_and_autodelete(update, context, "❌ Bot ke paas 'Ban Users' permission nahi hai.")
-        return
-
-    if not update.message or not update.message.reply_to_message:
-        await reply_and_autodelete(update, context, "❌ Member ke message ko reply karke /ban likhein.")
-        return
-
-    target = update.message.reply_to_message.from_user
-    if not target or target.is_bot:
-        return
-
-    chat_id = update.effective_chat.id
-
-    if await is_admin(update, context, target.id):
-        await reply_and_autodelete(update, context, "❌ Admin ko ban nahi kiya ja sakta.")
-        return
-
     config = await get_group_config(chat_id)
 
+    warnings = config.get(
+        "user_warnings",
+        {},
+    )
+
+    warnings.pop(str(target.id), None)
+
+    await update_group_config(
+        chat_id,
+        "user_warnings",
+        warnings,
+    )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        f"✅ Warnings reset for "
+        f"<b>{html.escape(get_name(target))}</b>.",
+    )
+
+
+# ====================================================
+# 10. BAN / UNBAN / MUTE / UNMUTE
+# ====================================================
+async def ban_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    if not update.message.reply_to_message:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a member's message to ban.",
+        )
+        return
+
+    target = (
+        update.message.reply_to_message.from_user
+    )
+
+    if not target or target.is_bot:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Invalid user target.",
+        )
+        return
+
+    if await is_admin(
+        update,
+        context,
+        target.id,
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Admins cannot be banned.",
+        )
+        return
+
+    chat_id = update.effective_chat.id
+
     try:
-        await context.bot.ban_chat_member(chat_id, target.id)
-        safe_name = html.escape(get_name(target))
-        msg = f"🚫 <b>{safe_name}</b> {html.escape(config.get('remove_body', ''))}"
-    except TelegramError as error:
-        msg = f"❌ Ban failed: {html.escape(str(error))}"
+        await context.bot.ban_chat_member(
+            chat_id=chat_id,
+            user_id=target.id,
+        )
 
-    await reply_and_autodelete(update, context, msg)
+        await invalidate_admin_cache(
+            chat_id,
+            target.id,
+        )
 
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
+        config = await get_group_config(chat_id)
+
+        template = config.get(
+            "remove_text",
+            DEFAULT_GROUP_SETTINGS["remove_text"],
+        )
+
+        msg = render_template(
+            template,
+            target,
+            update.effective_chat,
+        )
+
+        await reply_with_autodelete(
+            update,
+            context,
+            f"🚫 {msg}",
+        )
+
+    except TelegramError as e:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Failed to ban user: "
+            f"{html.escape(str(e))}",
+        )
+
+
+async def unban_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    if not await is_admin(update, context, update.effective_user.id):
+    if not update.message.reply_to_message:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a banned user's message "
+            "to unban.",
+        )
         return
 
-    if not await bot_can_manage_members(update, context):
-        await reply_and_autodelete(update, context, "❌ Bot ke paas 'Ban Users' permission nahi hai.")
-        return
+    target = (
+        update.message.reply_to_message.from_user
+    )
 
-    if not update.message or not update.message.reply_to_message:
-        await reply_and_autodelete(update, context, "❌ Banned member ke message ko reply karke /unban likhein.")
-        return
-
-    target = update.message.reply_to_message.from_user
     if not target:
         return
 
     try:
-        await context.bot.unban_chat_member(update.effective_chat.id, target.id, only_if_banned=True)
-        safe_name = html.escape(get_name(target))
-        msg = f"✅ <b>{safe_name}</b> ko unban kar diya gaya hai."
-    except TelegramError as error:
-        msg = f"❌ Unban failed: {html.escape(str(error))}"
+        await context.bot.unban_chat_member(
+            chat_id=update.effective_chat.id,
+            user_id=target.id,
+            only_if_banned=True,
+        )
 
-    await reply_and_autodelete(update, context, msg)
-
-async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    if not await bot_can_manage_members(update, context):
-        await reply_and_autodelete(update, context, "❌ Bot ke paas 'Restrict Members' permission nahi hai.")
-        return
-
-    if not update.message or not update.message.reply_to_message:
-        await reply_and_autodelete(update, context, "❌ Member ke message ko reply karke /mute likhein.")
-        return
-
-    target = update.message.reply_to_message.from_user
-    if not target or target.is_bot:
-        return
-
-    if await is_admin(update, context, target.id):
-        await reply_and_autodelete(update, context, "❌ Admin ko mute nahi kiya ja sakta.")
-        return
-
-    try:
-        await context.bot.restrict_chat_member(
+        await invalidate_admin_cache(
             update.effective_chat.id,
             target.id,
-            permissions=ChatPermissions(can_send_messages=False),
         )
-        safe_name = html.escape(get_name(target))
-        msg = f"🔇 <b>{safe_name}</b> ko mute kar diya gaya hai."
-    except TelegramError as error:
-        msg = f"❌ Mute failed: {html.escape(str(error))}"
 
-    await reply_and_autodelete(update, context, msg)
+        await reply_with_autodelete(
+            update,
+            context,
+            f"✅ Unbanned "
+            f"<b>{html.escape(get_name(target))}</b>.",
+        )
 
-async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
+    except TelegramError as e:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Failed to unban: "
+            f"{html.escape(str(e))}",
+        )
+
+
+async def mute_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    if not await is_admin(update, context, update.effective_user.id):
+    if not update.message.reply_to_message:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a member's message to mute.",
+        )
         return
 
-    if not await bot_can_manage_members(update, context):
-        await reply_and_autodelete(update, context, "❌ Bot ke paas 'Restrict Members' permission nahi hai.")
+    target = (
+        update.message.reply_to_message.from_user
+    )
+
+    if not target or target.is_bot:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Invalid user target.",
+        )
         return
 
-    if not update.message or not update.message.reply_to_message:
-        await reply_and_autodelete(update, context, "❌ Member ke message ko reply karke /unmute likhein.")
-        return
-
-    target = update.message.reply_to_message.from_user
-    if not target:
+    if await is_admin(
+        update,
+        context,
+        target.id,
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Admins cannot be muted.",
+        )
         return
 
     try:
-        # Full Comprehensive Member Permission Restoration
-        full_permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=True,
-            can_pin_messages=False,
-        )
         await context.bot.restrict_chat_member(
             chat_id=update.effective_chat.id,
             user_id=target.id,
-            permissions=full_permissions,
+            permissions=ChatPermissions(
+                can_send_messages=False
+            ),
         )
-        safe_name = html.escape(get_name(target))
-        msg = f"🔊 <b>{safe_name}</b> ko unmute kar diya gaya hai."
-    except TelegramError as error:
-        msg = f"❌ Unmute failed: {html.escape(str(error))}"
 
-    await reply_and_autodelete(update, context, msg)
+        await reply_with_autodelete(
+            update,
+            context,
+            f"🔇 <b>{html.escape(get_name(target))}</b> "
+            f"has been muted.",
+        )
 
-# ============================================================
-# AUTO DELETE & BADWORD COMMANDS
-# ============================================================
+    except TelegramError as e:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Mute failed: "
+            f"{html.escape(str(e))}",
+        )
 
-async def autodelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
+
+async def unmute_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    if not await is_admin(update, context, update.effective_user.id):
+    if not update.message.reply_to_message:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a member's message to unmute.",
+        )
         return
 
-    if not context.args or context.args[0].lower() not in ("on", "off"):
-        await reply_and_autodelete(update, context, "❌ Usage: /autodelete on OR /autodelete off")
+    target = (
+        update.message.reply_to_message.from_user
+    )
+
+    if not target:
         return
 
-    value = context.args[0].lower() == "on"
-    await update_group_config(update.effective_chat.id, "autodelete", value)
-    await reply_and_autodelete(update, context, f"✅ Auto-delete: {'ON' if value else 'OFF'}")
+    chat_id = update.effective_chat.id
 
-async def setdeletetime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
+    try:
+        permissions = ChatPermissions(
+            can_send_messages=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+        )
+
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=target.id,
+            permissions=permissions,
+        )
+
+        await reply_with_autodelete(
+            update,
+            context,
+            f"🔊 <b>{html.escape(get_name(target))}</b> "
+            f"has been unmuted.",
+        )
+
+    except TelegramError as e:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Unmute failed: "
+            f"{html.escape(str(e))}",
+        )
+
+
+# ====================================================
+# 11. ANTI-BADWORD
+# ====================================================
+def build_badword_pattern(badwords: List[str]):
+    words = [
+        str(word).strip().lower()
+        for word in badwords
+        if str(word).strip()
+    ]
+
+    if not words:
+        return None
+
+    return re.compile(
+        r"\b(?:"
+        + "|".join(re.escape(w) for w in words)
+        + r")\b",
+        re.IGNORECASE,
+    )
+
+
+async def antibadword_toggle(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    if not await is_admin(update, context, update.effective_user.id):
+    if (
+        not context.args
+        or context.args[0].lower() not in ("on", "off")
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: "
+            "<code>/antibadword on|off</code>",
+        )
         return
 
-    if not context.args or not context.args[0].isdigit() or int(context.args[0]) < 0:
-        await reply_and_autodelete(update, context, "❌ Usage: /setdeletetime <minutes>")
+    state = context.args[0].lower() == "on"
+
+    await update_group_config(
+        update.effective_chat.id,
+        "anti_badword",
+        state,
+    )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        "✅ Anti-Badword filter is now "
+        f"<b>{'ON' if state else 'OFF'}</b>.",
+    )
+
+
+async def addbadword_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    minutes = int(context.args[0])
-    await update_group_config(update.effective_chat.id, "delete_time", minutes * 60)
-    await reply_and_autodelete(update, context, f"✅ Bot message deletion time: {minutes} minutes.")
+    word = (
+        update.message.text.partition(" ")[2]
+        .strip()
+        .lower()
+    )
 
-async def autoreplydelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
+    if not word or len(word) > 100:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: "
+            "<code>/addbadword &lt;word&gt;</code>",
+        )
         return
 
-    if not await is_admin(update, context, update.effective_user.id):
+    chat_id = update.effective_chat.id
+    config = await get_group_config(chat_id)
+    words = config.get("badwords", [])
+
+    if word not in words:
+        words.append(word)
+
+        await update_group_config(
+            chat_id,
+            "badwords",
+            words,
+        )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        f"✅ Added "
+        f"<b>{html.escape(word)}</b> to badwords.",
+    )
+
+
+async def delbadword_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    if not context.args or context.args[0].lower() not in ("on", "off"):
-        await reply_and_autodelete(update, context, "❌ Usage: /autoreplydelete on OR /autoreplydelete off")
-        return
+    word = (
+        update.message.text.partition(" ")[2]
+        .strip()
+        .lower()
+    )
 
-    value = context.args[0].lower() == "on"
-    await update_group_config(update.effective_chat.id, "autoreplydelete", value)
-    await reply_and_autodelete(update, context, f"✅ Auto-reply delete: {'ON' if value else 'OFF'}")
+    chat_id = update.effective_chat.id
+    config = await get_group_config(chat_id)
+    words = config.get("badwords", [])
 
-async def setreplydelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
+    if word in words:
+        words.remove(word)
 
-    if not await is_admin(update, context, update.effective_user.id):
-        return
+        await update_group_config(
+            chat_id,
+            "badwords",
+            words,
+        )
 
-    if not context.args or not context.args[0].isdigit() or int(context.args[0]) < 0:
-        await reply_and_autodelete(update, context, "❌ Usage: /setreplydelete <minutes>")
-        return
+        await reply_with_autodelete(
+            update,
+            context,
+            f"✅ Removed "
+            f"<b>{html.escape(word)}</b> from badwords.",
+        )
 
-    minutes = int(context.args[0])
-    await update_group_config(update.effective_chat.id, "reply_delete_time", minutes * 60)
-    await reply_and_autodelete(update, context, f"✅ Auto-reply deletion time: {minutes} minutes.")
-
-async def antibadword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    if not context.args or context.args[0].lower() not in ("on", "off"):
-        await reply_and_autodelete(update, context, "❌ Usage: /antibadword on OR /antibadword off")
-        return
-
-    value = context.args[0].lower() == "on"
-    await update_group_config(update.effective_chat.id, "antibadword", value)
-    await reply_and_autodelete(update, context, f"✅ Anti-badword: {'ON' if value else 'OFF'}")
-
-async def addbadword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    word = " ".join(context.args).strip().lower()
-    if not word:
-        await reply_and_autodelete(update, context, "❌ Usage: /addbadword <word>")
-        return
-
-    config = await get_group_config(update.effective_chat.id)
-    badwords = list(config.get("badwords", []))
-
-    if word not in badwords:
-        badwords.append(word)
-        await update_group_config(update.effective_chat.id, "badwords", badwords)
-
-    await reply_and_autodelete(update, context, f"✅ Badword added: {html.escape(word)}")
-
-async def delbadword_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    word = " ".join(context.args).strip().lower()
-    if not word:
-        await reply_and_autodelete(update, context, "❌ Usage: /delbadword <word>")
-        return
-
-    config = await get_group_config(update.effective_chat.id)
-    badwords = list(config.get("badwords", []))
-
-    if word in badwords:
-        badwords.remove(word)
-        await update_group_config(update.effective_chat.id, "badwords", badwords)
-
-    await reply_and_autodelete(update, context, f"✅ Badword removed: {html.escape(word)}")
-
-async def listbadwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    config = await get_group_config(update.effective_chat.id)
-    badwords = config.get("badwords", [])
-
-    if not badwords:
-        text = "📜 Badwords list is empty."
     else:
-        text = "📜 Badwords List:\n" + "\n".join(f"• {html.escape(word)}" for word in badwords)
-
-    await reply_and_autodelete(update, context, text)
-
-# ============================================================
-# SAFE SLOW MODE NOTIFICATION COMMAND
-# ============================================================
-
-async def slowmode_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Safe Info Handler for Slowmode as Telegram Bot API does not expose direct Bot method."""
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    if not await is_admin(update, context, update.effective_user.id):
-        return
-
-    msg = (
-        "ℹ️ <b>Slow Mode Information:</b>\n"
-        "Telegram Bot API limits slow-mode changes directly via Bots.\n"
-        "Please set Slow Mode directly from <b>Group Settings -> Permissions -> Slow Mode</b> in Telegram."
-    )
-    await reply_and_autodelete(update, context, msg)
-
-# ============================================================
-# EVENT HANDLERS (WELCOME / EXIT / REMOVE)
-# ============================================================
-
-async def send_welcome(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not user or user.is_bot:
-        return
-
-    if await event_seen_recently(chat_id, user.id, "join"):
-        return
-
-    config = await get_group_config(chat_id)
-    safe_name = html.escape(get_name(user))
-    text = f"🎉 Welcome <b>{safe_name}</b>! 👋❤️\n\n{html.escape(config.get('welcome_body', ''))}"
-
-    try:
-        sent = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Word not found in badwords list.",
         )
-        if config.get("autodelete", True):
-            schedule_auto_delete(context, chat_id, sent.message_id, int(config.get("delete_time", 300)))
-    except TelegramError as error:
-        logger.error("Welcome message failed in %s: %s", chat_id, error)
 
-async def send_exit(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not user or user.is_bot:
+
+async def listbadwords_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    if await event_seen_recently(chat_id, user.id, "leave"):
-        return
-
-    config = await get_group_config(chat_id)
-    safe_name = html.escape(get_name(user))
-    text = f"👋 Goodbye <b>{safe_name}</b>! ❤️\n\n{html.escape(config.get('exit_body', ''))}"
-
-    try:
-        sent = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        if config.get("autodelete", True):
-            schedule_auto_delete(context, chat_id, sent.message_id, int(config.get("delete_time", 300)))
-    except TelegramError as error:
-        logger.error("Exit message failed in %s: %s", chat_id, error)
-
-async def send_remove_message(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not user or user.is_bot:
-        return
-
-    if await event_seen_recently(chat_id, user.id, "remove"):
-        return
-
-    config = await get_group_config(chat_id)
-    safe_name = html.escape(get_name(user))
-    text = f"🚫 <b>{safe_name}</b> {html.escape(config.get('remove_body', ''))}"
-
-    try:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-        if config.get("autodelete", True):
-            schedule_auto_delete(context, chat_id, sent.message_id, int(config.get("delete_time", 300)))
-    except TelegramError as error:
-        logger.error("Remove message failed in %s: %s", chat_id, error)
-
-def member_status_is_member(status: str) -> bool:
-    return status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.OWNER,
-        ChatMemberStatus.RESTRICTED,
+    config = await get_group_config(
+        update.effective_chat.id
     )
 
-async def handle_member_transition(
-    chat_id: int,
-    old_status: str,
-    new_status: str,
-    user,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not user or user.is_bot:
+    words = config.get("badwords", [])
+    words_text = ", ".join(words) if words else "None"
+
+    await reply_with_autodelete(
+        update,
+        context,
+        "🤬 <b>Configured Badwords:</b>\n"
+        f"<code>{html.escape(words_text)}</code>",
+    )
+
+
+# ====================================================
+# 12. AUTO DELETE / SLOW MODE
+# ====================================================
+def valid_delay(value: str):
+    try:
+        sec = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not MIN_DELETE_TIME <= sec <= MAX_DELETE_TIME:
+        return None
+
+    return sec
+
+
+async def autodelete_toggle(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    was_member = member_status_is_member(old_status)
-    is_member = member_status_is_member(new_status)
-
-    joined = not was_member and is_member
-    left = was_member and new_status == ChatMemberStatus.LEFT
-    banned = was_member and new_status == ChatMemberStatus.BANNED
-
-    safe_name = html.escape(get_name(user))
-
-    # Detect Admin Promotions / Demotions
-    if old_status != ChatMemberStatus.ADMINISTRATOR and new_status == ChatMemberStatus.ADMINISTRATOR:
-        msg = f"⭐ <b>{safe_name}</b> ko Admin promote kar diya gaya hai!"
-        await send_standalone_autodelete(chat_id, context, msg)
-        return
-    elif old_status == ChatMemberStatus.ADMINISTRATOR and new_status != ChatMemberStatus.ADMINISTRATOR:
-        msg = f"📉 <b>{safe_name}</b> ko Admin status se demote kar diya gaya hai."
-        await send_standalone_autodelete(chat_id, context, msg)
+    if (
+        not context.args
+        or context.args[0].lower() not in ("on", "off")
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: <code>/autodelete on|off</code>",
+        )
         return
 
-    if joined:
-        await send_welcome(chat_id, user, context)
-    elif left:
-        await send_exit(chat_id, user, context)
-    elif banned:
-        await send_remove_message(chat_id, user, context)
+    state = context.args[0].lower() == "on"
 
-async def chat_member_updated_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    member_update = update.chat_member or update.my_chat_member
+    await update_group_config(
+        update.effective_chat.id,
+        "auto_delete",
+        state,
+    )
 
-    if not member_update or not update.effective_chat:
+    await reply_with_autodelete(
+        update,
+        context,
+        "✅ Global Auto-Delete is now "
+        f"<b>{'ON' if state else 'OFF'}</b>.",
+    )
+
+
+async def setdeletetime_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
         return
 
-    old_status = member_update.old_chat_member.status
-    new_status = member_update.new_chat_member.status
-    user = member_update.new_chat_member.user
-
-    await handle_member_transition(update.effective_chat.id, old_status, new_status, user, context)
-
-# ============================================================
-# FLOOD CONTROL ENGINE
-# ============================================================
-
-async def check_and_handle_flood(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    user,
-    config: Dict[str, Any]
-) -> bool:
-    if not config.get("floodcontrol", True):
-        return False
-
-    limit = int(config.get("flood_limit", 5))
-    window = int(config.get("flood_window", 10))
-    now = asyncio.get_running_loop().time()
-    key = (chat_id, user.id)
-
-    async with FLOOD_LOCK:
-        if len(FLOOD_TRACKER) > 1000:
-            for k in list(FLOOD_TRACKER.keys()):
-                FLOOD_TRACKER[k] = [t for t in FLOOD_TRACKER[k] if now - t < window]
-                if not FLOOD_TRACKER[k]:
-                    FLOOD_TRACKER.pop(k, None)
-
-        user_timestamps = FLOOD_TRACKER.get(key, [])
-        user_timestamps = [t for t in user_timestamps if now - t < window]
-        user_timestamps.append(now)
-        FLOOD_TRACKER[key] = user_timestamps
-
-        if len(user_timestamps) > limit:
-            try:
-                if update.message:
-                    await update.message.delete()
-            except TelegramError:
-                pass
-
-            if len(user_timestamps) == limit + 1:
-                await apply_warning_logic(
-                    chat_id, user, context, reason_prefix="⚠️ Spam/Flood karne ke karan"
-                )
-            return True
-
-    return False
-
-# ============================================================
-# MAIN MESSAGE PROCESSOR & MODERATION
-# ============================================================
-
-async def process_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_chat or not update.message.from_user:
+    if not context.args:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Usage: "
+            f"<code>/setdeletetime seconds</code>\n"
+            f"Allowed: {MIN_DELETE_TIME}-"
+            f"{MAX_DELETE_TIME} seconds.",
+        )
         return
 
-    user = update.message.from_user
+    sec = valid_delay(context.args[0])
+
+    if sec is None:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Time must be between "
+            f"{MIN_DELETE_TIME} and "
+            f"{MAX_DELETE_TIME} seconds.",
+        )
+        return
+
+    await update_group_config(
+        update.effective_chat.id,
+        "delete_time",
+        sec,
+    )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        f"✅ Auto-delete duration set to "
+        f"<b>{sec}</b> seconds.",
+    )
+
+
+async def autoreplydelete_toggle(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    if (
+        not context.args
+        or context.args[0].lower() not in ("on", "off")
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Usage: "
+            "<code>/autoreplydelete on|off</code>",
+        )
+        return
+
+    state = context.args[0].lower() == "on"
+
+    await update_group_config(
+        update.effective_chat.id,
+        "auto_reply_delete",
+        state,
+    )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        "✅ Auto-Reply Delete is now "
+        f"<b>{'ON' if state else 'OFF'}</b>.",
+    )
+
+
+async def setreplydelete_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    if not context.args:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Usage: "
+            f"<code>/setreplydelete seconds</code>\n"
+            f"Allowed: {MIN_DELETE_TIME}-"
+            f"{MAX_DELETE_TIME} seconds.",
+        )
+        return
+
+    sec = valid_delay(context.args[0])
+
+    if sec is None:
+        await reply_with_autodelete(
+            update,
+            context,
+            f"❌ Time must be between "
+            f"{MIN_DELETE_TIME} and "
+            f"{MAX_DELETE_TIME} seconds.",
+        )
+        return
+
+    await update_group_config(
+        update.effective_chat.id,
+        "reply_delete_time",
+        sec,
+    )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        f"✅ Auto-reply delete duration set to "
+        f"<b>{sec}</b> seconds.",
+    )
+
+
+async def slowmode_command(update, context):
+    try:
+        chat = await context.bot.get_chat(
+            update.effective_chat.id
+        )
+
+        delay = getattr(
+            chat,
+            "slow_mode_delay",
+            None,
+        )
+
+        if delay:
+            text = (
+                f"⏳ <b>Slow Mode Active</b>\n"
+                f"Members must wait <b>{delay}</b> "
+                f"seconds between messages."
+            )
+        else:
+            text = (
+                "ℹ️ Slow Mode is currently disabled."
+            )
+
+        await reply_with_autodelete(
+            update,
+            context,
+            text,
+        )
+
+    except TelegramError:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Unable to fetch slow mode configuration.",
+        )
+
+
+# ====================================================
+# 13. REPORT SYSTEM
+# ====================================================
+async def report_command(update, context):
+    if (
+        not update.effective_user
+        or not update.effective_chat
+    ):
+        return
+
+    if (
+        not update.message
+        or not update.message.reply_to_message
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a member's message "
+            "with /report.",
+        )
+        return
+
+    reporter = update.effective_user
+    target = (
+        update.message.reply_to_message.from_user
+    )
+    chat_id = update.effective_chat.id
+
+    if not target or target.is_bot:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Cannot report bot accounts.",
+        )
+        return
+
+    if reporter.id == target.id:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ You cannot report yourself.",
+        )
+        return
+
+    if await is_admin(
+        update,
+        context,
+        target.id,
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Admins cannot be reported.",
+        )
+        return
+
+    lock = await get_user_lock(
+        REPORT_LOCKS,
+        (chat_id, target.id),
+    )
+
+    async with lock:
+        config = await get_group_config(chat_id)
+
+        if not config.get(
+            "report_system",
+            True,
+        ):
+            await reply_with_autodelete(
+                update,
+                context,
+                "ℹ️ Report system is currently disabled.",
+            )
+            return
+
+        reports = config.get("reports", {})
+        target_key = str(target.id)
+
+        reporter_ids = reports.get(
+            target_key,
+            [],
+        )
+
+        if reporter.id in reporter_ids:
+            await reply_with_autodelete(
+                update,
+                context,
+                "⚠️ You have already reported "
+                "this member.",
+            )
+            return
+
+        reporter_ids.append(reporter.id)
+        reports[target_key] = reporter_ids
+
+        try:
+            report_limit = int(
+                config.get("report_limit", 5)
+            )
+        except (TypeError, ValueError):
+            report_limit = 5
+
+        report_limit = max(
+            1,
+            min(report_limit, 50),
+        )
+
+        report_count = len(reporter_ids)
+
+        await update_group_config(
+            chat_id,
+            "reports",
+            reports,
+        )
+
+        if report_count < report_limit:
+            progress_text = (
+                f"🚨 <b>Report Received!</b>\n"
+                f"👤 Target: "
+                f"<b>{html.escape(get_name(target))}</b>\n"
+                f"📊 Progress: "
+                f"<b>{report_count}/{report_limit}</b>"
+            )
+        else:
+            progress_text = None
+
+    if progress_text:
+        await reply_with_autodelete(
+            update,
+            context,
+            progress_text,
+            is_reply=True,
+        )
+        return
+
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    deleted_count = await delete_tracked_user_messages(
+        chat_id,
+        target.id,
+        context,
+    )
+
+    restricted = False
+
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=target.id,
+            permissions=ChatPermissions(
+                can_send_messages=False
+            ),
+        )
+
+        restricted = True
+
+    except TelegramError as e:
+        logger.error(
+            "Report restriction failed: %s",
+            e,
+        )
+
+    lock = await get_user_lock(
+        REPORT_LOCKS,
+        (chat_id, target.id),
+    )
+
+    async with lock:
+        config = await get_group_config(chat_id)
+        reports = config.get("reports", {})
+
+        reports.pop(
+            str(target.id),
+            None,
+        )
+
+        await update_group_config(
+            chat_id,
+            "reports",
+            reports,
+        )
+
+    safe_name = html.escape(
+        get_name(target)
+    )
+
+    if restricted:
+        message = (
+            f"🚨 <b>REPORT LIMIT REACHED</b> 🚨\n\n"
+            f"👤 Target: <b>{safe_name}</b>\n"
+            f"📊 Unique Reports: "
+            f"<b>{report_count}/{report_limit}</b>\n"
+            f"🗑️ Recent tracked messages deleted: "
+            f"<b>{deleted_count}</b>\n\n"
+            f"🔇 Target has been restricted/muted.\n"
+            f"⚠️ <b>NO AUTOMATIC BAN</b> was executed. "
+            f"Admins should review manually."
+        )
+    else:
+        message = (
+            f"⚠️ <b>REPORT LIMIT REACHED</b>\n\n"
+            f"👤 Target: <b>{safe_name}</b>\n"
+            f"📊 Reports: "
+            f"<b>{report_count}/{report_limit}</b>\n"
+            f"🗑️ Recent tracked messages deleted: "
+            f"<b>{deleted_count}</b>\n\n"
+            f"❌ Bot could not restrict the user. "
+            f"Please check admin permissions."
+        )
+
+    await send_standalone_autodelete(
+        chat_id,
+        context,
+        message,
+    )
+
+
+async def resetreports_command(update, context):
+    if not await is_admin(
+        update,
+        context,
+        update.effective_user.id,
+    ):
+        return
+
+    if not update.message.reply_to_message:
+        await reply_with_autodelete(
+            update,
+            context,
+            "❌ Reply to a member's message "
+            "to reset reports.",
+        )
+        return
+
+    target = (
+        update.message.reply_to_message.from_user
+    )
+
+    if not target:
+        return
+
+    chat_id = update.effective_chat.id
+
+    lock = await get_user_lock(
+        REPORT_LOCKS,
+        (chat_id, target.id),
+    )
+
+    async with lock:
+        config = await get_group_config(chat_id)
+        reports = config.get("reports", {})
+
+        reports.pop(
+            str(target.id),
+            None,
+        )
+
+        await update_group_config(
+            chat_id,
+            "reports",
+            reports,
+        )
+
+    await reply_with_autodelete(
+        update,
+        context,
+        f"✅ Reports reset for "
+        f"<b>{html.escape(get_name(target))}</b>.",
+    )
+
+
+# ====================================================
+# 14. MODERATION PIPELINE
+# ====================================================
+async def process_messages(update, context):
+    if (
+        not update.effective_chat
+        or not update.message
+        or not update.effective_user
+    ):
+        return
+
+    user = update.effective_user
+
     if user.is_bot:
         return
 
     chat_id = update.effective_chat.id
+    message_id = update.message.message_id
+
+    text = (
+        update.message.text
+        or update.message.caption
+        or ""
+    )
+
+    admin = await is_admin(
+        update,
+        context,
+        user.id,
+    )
+
+    if not admin:
+        await track_user_message(
+            chat_id,
+            user.id,
+            message_id,
+        )
+
     config = await get_group_config(chat_id)
-    text = update.message.text or update.message.caption or ""
-    admin = await is_admin(update, context, user.id)
 
-    # 1.     # 1. FLOOD CONTROL (EXEMPT ADMINS + PHOTOS)
-    if not admin and not update.message.photo:
-        is_flooding = await check_and_handle_flood(
-            update, context, chat_id, user, config
+    # ------------------------------------------------
+    # 14.1 BADWORD
+    # Gali -> DELETE + DIRECT BAN
+    # ------------------------------------------------
+    if (
+        not admin
+        and config.get("anti_badword", True)
+    ):
+        pattern = build_badword_pattern(
+            config.get("badwords", [])
         )
-        if is_flooding:
-            return
-    
 
-    # 2. ANTI-LINK SYSTEM (EXEMPT ADMINS)
-    if not admin and contains_disallowed_link(update, text):
-        try:
-            await update.message.delete()
-        except TelegramError as error:
-            logger.warning("Link message delete failed: %s", error)
-
-        await apply_warning_logic(
-            chat_id, user, context, reason_prefix="⚠️ Disallowed link share karne par"
-        )
-        return
-
-    # 3. ANTI-BADWORD SYSTEM (EXEMPT ADMINS)
-    if config.get("antibadword", True) and not admin and text:
-        badwords = config.get("badwords", [])
-        if text_contains_badword(text, badwords):
+        if pattern and pattern.search(text):
             try:
                 await update.message.delete()
-            except TelegramError as error:
-                logger.warning("Badword message delete failed: %s", error)
+            except TelegramError:
+                pass
 
-            # Delete + Increment Warning + Auto-Ban on 3rd Warning
-            await apply_warning_logic(
-                chat_id, user, context, reason_prefix="⚠️ Badwords use karne par"
-            )
+            try:
+                await context.bot.ban_chat_member(
+                    chat_id=chat_id,
+                    user_id=user.id,
+                )
+
+                await invalidate_admin_cache(
+                    chat_id,
+                    user.id,
+                )
+
+                template = config.get(
+                    "remove_text",
+                    DEFAULT_GROUP_SETTINGS["remove_text"],
+                )
+
+                ban_message = render_template(
+                    template,
+                    user,
+                    update.effective_chat,
+                )
+
+                await send_standalone_autodelete(
+                    chat_id,
+                    context,
+                    "🚫 <b>Badword Violation — "
+                    "User Banned</b>\n"
+                    f"{ban_message}",
+                )
+
+            except TelegramError as e:
+                logger.error(
+                    "Failed direct badword ban: %s",
+                    e,
+                )
+
+                await send_standalone_autodelete(
+                    chat_id,
+                    context,
+                    f"⚠️ Badword detected from "
+                    f"<b>{html.escape(get_name(user))}</b>, "
+                    f"but the bot could not ban the user. "
+                    f"Check admin permissions.",
+                )
+
             return
 
-    # 4. GREETING AUTO-REPLIES
-    if text and is_greeting_message(text):
-        clean_text = re.sub(r"[^\w\s]", "", text.lower()).strip()
-        if "radhe" in clean_text:
-            reply_txt = "Radhe Radhe 🙏❤️"
-        else:
-            reply_txt = "Hlo 😊 Aap kaise ho? ❤️"
+    # ------------------------------------------------
+    # 14.2 FLOOD / SPAM
+    # Spam -> DELETE + WARNING, NO BAN
+    # ------------------------------------------------
+    if not admin:
+        now = time.monotonic()
+        key = (chat_id, user.id)
 
-        await reply_and_autodelete(update, context, reply_txt, is_reply_type=True)
+        trigger_warning = False
+        flood_triggered = False
+
+        async with FLOOD_LOCK:
+            timestamps = FLOOD_TRACKER.get(key, [])
+
+            timestamps = [
+                timestamp
+                for timestamp in timestamps
+                if now - timestamp < FLOOD_TIMEFRAME
+            ]
+
+            timestamps.append(now)
+
+            if len(timestamps) >= FLOOD_MSG_LIMIT:
+                flood_triggered = True
+
+                last_warning = (
+                    FLOOD_COOLDOWN_TRACKER.get(
+                        key,
+                        0.0,
+                    )
+                )
+
+                if (
+                    now - last_warning
+                    >= FLOOD_COOLDOWN_SEC
+                ):
+                    FLOOD_COOLDOWN_TRACKER[key] = now
+                    trigger_warning = True
+
+                # Reset after detecting one spam burst.
+                FLOOD_TRACKER[key] = []
+            else:
+                FLOOD_TRACKER[key] = timestamps
+
+        if flood_triggered:
+            try:
+                await update.message.delete()
+            except TelegramError:
+                pass
+
+            if trigger_warning:
+                await warn_user_internal(
+                    chat_id,
+                    user,
+                    context,
+                    "Flood / Spam",
+                )
+
+            return
+
+    # ------------------------------------------------
+    # 14.3 RESTRICTED LINKS
+    # Link -> DELETE + WARNING, NO BAN
+    # ------------------------------------------------
+    if (
+        not admin
+        and RESTRICTED_LINKS_REGEX.search(text)
+    ):
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+
+        await warn_user_internal(
+            chat_id,
+            user,
+            context,
+            "Posting Restricted Links",
+        )
+
         return
 
-    # 5. PHOTO AUTO-REPLY LOGIC (PHOTO + CAPTION QUESTION)
-    if update.message.photo:
-        caption = update.message.caption or ""
-        if caption and is_question_message(caption):
-            await reply_and_autodelete(
-                update,
-                context,
-                "📸 Chinta mat karo! 😊\n📝 Is question ka solution aapko bahut jald milega. ❤️",
-                is_reply_type=True,
-            )
-        return
+    # ------------------------------------------------
+    # 14.4 AUTO REPLIES
+    # ------------------------------------------------
+    lowered = text.lower().strip()
 
-    # 6. TEXT QUESTION / DOUBT AUTO-REPLY
-    if text and is_question_message(text):
-        await reply_and_autodelete(
+    if any(
+        greeting in lowered
+        for greeting in (
+            "radhe radhe",
+            "radhey radhey",
+            "jai shree radhe",
+        )
+    ):
+        await reply_with_autodelete(
             update,
             context,
-            "🤔 Doubt hai? Vishesh bhai se pucho! 📚❤️",
-            is_reply_type=True,
+            "🙏 <b>Radhe Radhe!</b> "
+            "May your day be productive and blessed.",
+            is_auto_reply=True,
         )
         return
 
-# ============================================================
-# GLOBAL ERROR HANDLER
-# ============================================================
+    is_photo = bool(update.message.photo)
 
-async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    is_question = (
+        "?" in text
+        or any(
+            word in lowered
+            for word in (
+                "doubt",
+                "help",
+                "kaise",
+                "solution",
+                "kya",
+            )
+        )
+    )
 
-# ============================================================
-# MAIN APPLICATION BUILDER
-# ============================================================
+    if (
+        (is_photo and is_question)
+        or (is_question and len(text) > 10)
+    ):
+        await reply_with_autodelete(
+            update,
+            context,
+            "❓ <b>Question Received!</b>\n"
+            "An Admin or Mentor will respond shortly. "
+            "Please wait patiently.",
+            is_reply=True,
+            is_auto_reply=True,
+        )
 
+
+# ====================================================
+# 15. ERROR HANDLER
+# ====================================================
+async def error_handler(update, context):
+    logger.error(
+        "Unhandled exception while processing update: %s",
+        context.error,
+    )
+
+
+# ====================================================
+# 16. MAIN
+# ====================================================
 def main() -> None:
-    if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN environment variable is missing. Set BOT_TOKEN before starting the bot.")
+    bot_token = os.getenv(
+        "BOT_TOKEN",
+        "",
+    ).strip()
+
+    if not bot_token:
+        logger.error(
+            "BOT_TOKEN environment variable is missing."
+        )
         return
 
     application = (
         Application.builder()
-        .token(BOT_TOKEN)
+        .token(bot_token)
         .build()
     )
 
-    application.add_error_handler(global_error_handler)
+    # Welcome / exit / removal
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS
+            | filters.StatusUpdate.LEFT_CHAT_MEMBER,
+            chat_member_handler,
+        )
+    )
 
-    # BASIC COMMANDS
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("rules", rules_command))
-    application.add_handler(CommandHandler("setrules", setrules_command))
-    application.add_handler(CommandHandler("setwelcome", setwelcome_command))
-    application.add_handler(CommandHandler("setexit", setexit_command))
-    application.add_handler(CommandHandler("setremove", setremove_command))
+    # Commands
+    application.add_handler(
+        CommandHandler(
+            "setwelcome",
+            setwelcome_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "setexit",
+            setexit_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "setremove",
+            setremove_command,
+        )
+    )
 
-    # MODERATION
-    application.add_handler(CommandHandler("warn", warn_command))
-    application.add_handler(CommandHandler("ban", ban_command))
-    application.add_handler(CommandHandler("unban", unban_command))
-    application.add_handler(CommandHandler("mute", mute_command))
-    application.add_handler(CommandHandler("unmute", unmute_command))
+    application.add_handler(
+        CommandHandler(
+            "rules",
+            rules_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "setrules",
+            setrules_command,
+        )
+    )
 
-    # PROTECTION / AUTO DELETE
-    application.add_handler(CommandHandler("autodelete", autodelete_command))
-    application.add_handler(CommandHandler("setdeletetime", setdeletetime_command))
-    application.add_handler(CommandHandler("autoreplydelete", autoreplydelete_command))
-    application.add_handler(CommandHandler("setreplydelete", setreplydelete_command))
-    application.add_handler(CommandHandler("antibadword", antibadword_command))
-    application.add_handler(CommandHandler("addbadword", addbadword_command))
-    application.add_handler(CommandHandler("delbadword", delbadword_command))
-    application.add_handler(CommandHandler("listbadwords", listbadwords_command))
+    application.add_handler(
+        CommandHandler(
+            "warn",
+            warn_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "resetwarning",
+            resetwarning_command,
+        )
+    )
 
-    # SLOW MODE INFO
-    application.add_handler(CommandHandler("slowmode", slowmode_info_command))
+    application.add_handler(
+        CommandHandler(
+            "ban",
+            ban_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "unban",
+            unban_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "mute",
+            mute_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "unmute",
+            unmute_command,
+        )
+    )
 
-    # MEMBER & GROUP EVENTS
-    application.add_handler(ChatMemberHandler(chat_member_updated_handler, ChatMemberHandler.CHAT_MEMBER))
-    application.add_handler(ChatMemberHandler(chat_member_updated_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(
+        CommandHandler(
+            "antibadword",
+            antibadword_toggle,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "addbadword",
+            addbadword_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "delbadword",
+            delbadword_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "listbadwords",
+            listbadwords_command,
+        )
+    )
 
-    # GENERAL MESSAGES & MODERATION
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, process_messages))
+    application.add_handler(
+        CommandHandler(
+            "autodelete",
+            autodelete_toggle,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "setdeletetime",
+            setdeletetime_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "autoreplydelete",
+            autoreplydelete_toggle,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "setreplydelete",
+            setreplydelete_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "slowmode",
+            slowmode_command,
+        )
+    )
 
-    logger.info("Bot starting polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    application.add_handler(
+        CommandHandler(
+            "report",
+            report_command,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            "resetreports",
+            resetreports_command,
+        )
+    )
+
+    # Normal messages (Text & Media)
+    application.add_handler(
+        MessageHandler(
+            (
+                filters.TEXT
+                | filters.PHOTO
+                | filters.VIDEO
+                | filters.DOCUMENT
+                | filters.AUDIO
+                | filters.VOICE
+            )
+            & ~filters.COMMAND,
+            process_messages,
+        ),
+        group=1,
+    )
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "Bot started successfully."
+    )
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
 
 if __name__ == "__main__":
     main()
