@@ -777,7 +777,6 @@ async def warn_user_internal(
         get_name(target_user)
     )
 
-    # Warning limit reached -> mute, NOT ban.
     if should_mute:
         try:
             await context.bot.restrict_chat_member(
@@ -2276,7 +2275,8 @@ def main() -> None:
                 filters.TEXT
                 | filters.PHOTO
                 | filters.VIDEO
-                | filters.Document.ALL                   | filters.AUDIO
+                | filters.Document.ALL
+                | filters.AUDIO
                 | filters.VOICE
             )
             & ~filters.COMMAND,
