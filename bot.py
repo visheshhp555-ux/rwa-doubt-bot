@@ -1993,13 +1993,13 @@ async def process_messages(update, context):
 
         return
 
-        # ------------------------------------------------
+            # ------------------------------------------------
     # 14.4 AUTO REPLIES
     # ------------------------------------------------
     lowered = text.lower().strip()
 
     # -----------------------------------------------
-    # Radhe Radhe auto reply
+    # RADHE RADHE AUTO REPLY
     # -----------------------------------------------
     if any(
         greeting in lowered
@@ -2012,14 +2012,56 @@ async def process_messages(update, context):
         await reply_with_autodelete(
             update,
             context,
-            "🙏 <b>Radhe Radhe!</b> "
-            "May your day be productive and blessed.",
+            "🙏 <b>Radhe Radhe!</b>\n"
+            "✨ Have a productive day!",
             is_auto_reply=True,
         )
         return
 
     # -----------------------------------------------
-    # Study / Doubt detection
+    # IGNORE SHORT / NORMAL CHAT
+    # -----------------------------------------------
+    normal_chat = {
+        "aap",
+        "ap",
+        "haan",
+        "han",
+        "ha",
+        "nahi",
+        "nai",
+        "ok",
+        "okay",
+        "hmm",
+        "hm",
+        "hi",
+        "hello",
+        "hey",
+        "bye",
+        "thanks",
+        "thank you",
+        "good morning",
+        "good night",
+        "good evening",
+        "bhai",
+        "bro",
+        "acha",
+        "achha",
+        "theek",
+        "thik",
+        "sahi",
+        "yes",
+        "no",
+    }
+
+    if lowered in normal_chat:
+        return
+
+    # Very short messages are not treated as questions.
+    if len(lowered) < 12:
+        return
+
+    # -----------------------------------------------
+    # STUDY / DOUBT KEYWORDS
     # -----------------------------------------------
     study_keywords = (
         "doubt",
@@ -2044,43 +2086,85 @@ async def process_messages(update, context):
         "answer",
         "board exam",
         "up board",
+        "class 12",
+        "class 11",
     )
 
-    is_study_question = (
-        len(text.strip()) >= 12
+    has_study_keyword = any(
+        keyword in lowered
+        for keyword in study_keywords
+    )
+
+    # -----------------------------------------------
+    # QUESTION DETECTION
+    # -----------------------------------------------
+    has_question_mark = "?" in text
+
+    # Question mark alone is NOT enough.
+    # It must also look like a genuine study question.
+    study_question = (
+        has_study_keyword
         and (
-            "?" in text
+            has_question_mark
             or any(
-                keyword in lowered
-                for keyword in study_keywords
+                phrase in lowered
+                for phrase in (
+                    "batao",
+                    "samjhao",
+                    "samjha do",
+                    "kaise kare",
+                    "kaise karna",
+                    "kaise hoga",
+                    "kaise solve",
+                    "answer kya",
+                    "solution kya",
+                    "iska answer",
+                    "iska solution",
+                    "iskaise",
+                )
             )
         )
     )
 
-    # Photo + study/doubt text
+    # -----------------------------------------------
+    # PHOTO + STUDY QUESTION
+    # -----------------------------------------------
     is_photo = bool(update.message.photo)
 
-    if is_photo and text.strip():
-        is_study_question = (
-            "?" in text
+    if is_photo and text:
+        study_question = (
+            has_study_keyword
+            or has_question_mark
             or any(
-                keyword in lowered
-                for keyword in study_keywords
+                phrase in lowered
+                for phrase in (
+                    "batao",
+                    "samjhao",
+                    "samjha do",
+                    "solve",
+                    "answer",
+                    "solution",
+                    "kaise",
+                )
             )
         )
 
-    if is_study_question:
+    # -----------------------------------------------
+    # SEND AUTO REPLY ONLY FOR REAL STUDY DOUBTS
+    # -----------------------------------------------
+    if study_question:
         await reply_with_autodelete(
             update,
             context,
             "❓ <b>Question Received!</b>\n\n"
-            "📚 Admin ya Mentor aapke doubt ka reply "
-            "jaldi karenge.\n\n"
+            "📚 Admin ya Mentor aapke doubt ka "
+            "reply jaldi karenge.\n\n"
             "⏳ Please wait patiently.",
             is_reply=True,
             is_auto_reply=True,
         )
         return
+        
 # 15. ERROR HANDLER
 # ====================================================
 async def error_handler(update, context):
