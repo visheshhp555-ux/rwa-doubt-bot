@@ -1993,11 +1993,14 @@ async def process_messages(update, context):
 
         return
 
-    # ------------------------------------------------
+        # ------------------------------------------------
     # 14.4 AUTO REPLIES
     # ------------------------------------------------
     lowered = text.lower().strip()
 
+    # -----------------------------------------------
+    # Radhe Radhe auto reply
+    # -----------------------------------------------
     if any(
         greeting in lowered
         for greeting in (
@@ -2015,38 +2018,69 @@ async def process_messages(update, context):
         )
         return
 
-    is_photo = bool(update.message.photo)
+    # -----------------------------------------------
+    # Study / Doubt detection
+    # -----------------------------------------------
+    study_keywords = (
+        "doubt",
+        "question",
+        "homework",
+        "assignment",
+        "ncert",
+        "pyq",
+        "mcq",
+        "physics",
+        "chemistry",
+        "maths",
+        "math",
+        "biology",
+        "chapter",
+        "formula",
+        "numerical",
+        "derivation",
+        "equation",
+        "solution",
+        "solve",
+        "answer",
+        "board exam",
+        "up board",
+    )
 
-    is_question = (
-        "?" in text
-        or any(
-            word in lowered
-            for word in (
-                "doubt",
-                "help",
-                "kaise",
-                "solution",
-                "kya",
+    is_study_question = (
+        len(text.strip()) >= 12
+        and (
+            "?" in text
+            or any(
+                keyword in lowered
+                for keyword in study_keywords
             )
         )
     )
 
-    if (
-        (is_photo and is_question)
-        or (is_question and len(text) > 10)
-    ):
+    # Photo + study/doubt text
+    is_photo = bool(update.message.photo)
+
+    if is_photo and text.strip():
+        is_study_question = (
+            "?" in text
+            or any(
+                keyword in lowered
+                for keyword in study_keywords
+            )
+        )
+
+    if is_study_question:
         await reply_with_autodelete(
             update,
             context,
-            "❓ <b>Question Received!</b>\n"
-            "An Admin or Mentor will respond shortly. "
-            "Please wait patiently.",
+            "❓ <b>Question Received!</b>\n\n"
+            "📚 Admin ya Mentor aapke doubt ka reply "
+            "jaldi karenge.\n\n"
+            "⏳ Please wait patiently.",
             is_reply=True,
             is_auto_reply=True,
         )
-
-
-# ====================================================
+        return
 # 15. ERROR HANDLER
 # ====================================================
 async def error_handler(update, context):
